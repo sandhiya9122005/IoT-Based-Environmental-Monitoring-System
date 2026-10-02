@@ -1,0 +1,738 @@
+#STM32
+
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : IoT Environmental Monitoring System
+  ******************************************************************************
+  */
+
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+
+/* Private variables ---------------------------------------------------------*/
+
+UART_HandleTypeDef huart1;
+
+DMA_HandleTypeDef hdma_usart1_tx;
+DMA_HandleTypeDef hdma_usart1_rx;
+
+
+/* USER CODE BEGIN PV */
+
+#define DHT11_PORT GPIOA
+#define DHT11_PIN  GPIO_PIN_1
+
+uint8_t temperature = 0;
+uint8_t humidity = 0;
+
+uint8_t txData[100];
+
+volatile uint8_t dma_tx_complete = 1;
+
+/* USER CODE END PV */
+
+
+/* Private function prototypes -----------------------------------------------*/
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_USART1_UART_Init(void);
+
+
+/* USER CODE BEGIN 0 */
+
+/* =========================================================
+   MICROSECOND DELAY
+   ========================================================= */
+
+void delay_us(uint32_t us)
+{
+    uint32_t count;
+
+    while (us--)
+    {
+        count = 8;
+
+        while (count--)
+        {
+            __NOP();
+        }
+    }
+}
+
+
+/* =========================================================
+   DHT11 PIN OUTPUT
+   ========================================================= */
+
+void DHT11_Output(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = DHT11_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+
+    HAL_GPIO_Init(DHT11_PORT, &GPIO_InitStruct);
+}
+
+
+/* =========================================================
+   DHT11 PIN INPUT
+   ========================================================= */
+
+void DHT11_Input(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = DHT11_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+
+    HAL_GPIO_Init(DHT11_PORT, &GPIO_InitStruct);
+}
+
+
+/* =========================================================
+   DHT11 READ
+   ========================================================= */
+
+uint8_t DHT11_Read(uint8_t *temperature,
+                   uint8_t *humidity)
+{
+    uint8_t data[5] = {0};
+
+    uint32_t timeout;
+    uint32_t i;
+    uint32_t j;
+
+
+    /* -----------------------------------------------------
+       START SIGNAL
+       ----------------------------------------------------- */
+
+    DHT11_Output();
+
+    HAL_GPIO_WritePin(DHT11_PORT,
+                      DHT11_PIN,
+                      GPIO_PIN_RESET);
+
+    HAL_Delay(20);
+
+    HAL_GPIO_WritePin(DHT11_PORT,
+                      DHT11_PIN,
+                      GPIO_PIN_SET);
+
+    delay_us(30);
+
+    DHT11_Input();
+
+
+    /* -----------------------------------------------------
+       DHT11 RESPONSE
+       ----------------------------------------------------- */
+
+    timeout = 1000;
+
+    while (HAL_GPIO_ReadPin(DHT11_PORT,
+                            DHT11_PIN) == GPIO_PIN_SET)
+    {
+        if (timeout-- == 0)
+            return 0;
+
+        delay_us(1);
+    }
+
+
+    timeout = 1000;
+
+    while (HAL_GPIO_ReadPin(DHT11_PORT,
+                            DHT11_PIN) == GPIO_PIN_RESET)
+    {
+        if (timeout-- == 0)
+            return 0;
+
+        delay_us(1);
+    }
+
+
+    timeout = 1000;
+
+    while (HAL_GPIO_ReadPin(DHT11_PORT,
+                            DHT11_PIN) == GPIO_PIN_SET)
+    {
+        if (timeout-- == 0)
+            return 0;
+
+        delay_us(1);
+    }
+
+
+    /* -----------------------------------------------------
+       READ 40 BITS
+       ----------------------------------------------------- */
+
+    for (i = 0; i < 5; i++)
+    {
+        for (j = 0; j < 8; j++)
+        {
+            /* Wait for LOW to finish */
+
+            timeout = 1000;
+
+            while (HAL_GPIO_ReadPin(DHT11_PORT,
+                                    DHT11_PIN) == GPIO_PIN_RESET)
+            {
+                if (timeout-- == 0)
+                    return 0;
+
+                delay_us(1);
+            }
+
+
+            /* Wait approximately 40 us */
+
+            delay_us(40);
+
+
+            /*
+             * If pin is still HIGH after 40 us,
+             * bit = 1
+             *
+             * Otherwise bit = 0
+             */
+
+            if (HAL_GPIO_ReadPin(DHT11_PORT,
+                                 DHT11_PIN) == GPIO_PIN_SET)
+            {
+                data[i] |= (1 << (7 - j));
+            }
+
+
+            /* Wait until HIGH becomes LOW */
+
+            timeout = 1000;
+
+            while (HAL_GPIO_ReadPin(DHT11_PORT,
+                                    DHT11_PIN) == GPIO_PIN_SET)
+            {
+                if (timeout-- == 0)
+                    return 0;
+
+                delay_us(1);
+            }
+        }
+    }
+
+
+    /* -----------------------------------------------------
+       CHECKSUM
+       ----------------------------------------------------- */
+
+    if ((uint8_t)(data[0] +
+                  data[1] +
+                  data[2] +
+                  data[3]) != data[4])
+    {
+        return 0;
+    }
+
+
+    /* -----------------------------------------------------
+       GET VALUES
+       ----------------------------------------------------- */
+
+    *humidity = data[0];
+
+    *temperature = data[2];
+
+
+    return 1;
+}
+
+
+/* =========================================================
+   DMA TRANSMISSION COMPLETE
+   ========================================================= */
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        dma_tx_complete = 1;
+    }
+}
+
+
+/* USER CODE END 0 */
+
+
+/**
+  * @brief  The application entry point.
+  */
+
+int main(void)
+{
+    /* Reset peripherals */
+
+    HAL_Init();
+
+
+    /* Configure clock */
+
+    SystemClock_Config();
+
+
+    /* Initialize peripherals */
+
+    MX_GPIO_Init();
+
+    MX_DMA_Init();
+
+    MX_USART1_UART_Init();
+
+
+    /* USER CODE BEGIN 2 */
+
+    char start_message[] =
+        "IoT Environmental Monitoring System\r\n";
+
+
+    /* Send startup message using DMA */
+
+    dma_tx_complete = 0;
+
+    HAL_UART_Transmit_DMA(&huart1,
+                          (uint8_t *)start_message,
+                          strlen(start_message));
+
+
+    HAL_Delay(1000);
+
+
+    /* USER CODE END 2 */
+
+
+    /* Infinite loop */
+
+    while (1)
+    {
+        /* -------------------------------------------------
+           READ DHT11
+           ------------------------------------------------- */
+
+        if (DHT11_Read(&temperature,
+                       &humidity))
+        {
+            /* Create message */
+
+            int length = sprintf(
+                (char *)txData,
+                "Temperature: %d C\r\nHumidity: %d %%\r\n",
+                temperature,
+                humidity
+            );
+
+
+            /* Wait for previous DMA transfer */
+
+            while (dma_tx_complete == 0)
+            {
+            }
+
+
+            /* Start new DMA transmission */
+
+            dma_tx_complete = 0;
+
+            HAL_UART_Transmit_DMA(
+                &huart1,
+                txData,
+                length
+            );
+        }
+        else
+        {
+            char error_message[] =
+                "DHT11 Error\r\n";
+
+
+            /* Wait for previous DMA transfer */
+
+            while (dma_tx_complete == 0)
+            {
+            }
+
+
+            dma_tx_complete = 0;
+
+
+            /* Send error using DMA */
+
+            HAL_UART_Transmit_DMA(
+                &huart1,
+                (uint8_t *)error_message,
+                strlen(error_message)
+            );
+        }
+
+
+        /* DHT11 minimum interval */
+
+        HAL_Delay(2000);
+    }
+}
+
+
+/* =========================================================
+   SYSTEM CLOCK
+   ========================================================= */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+
+    RCC_OscInitStruct.OscillatorType =
+        RCC_OSCILLATORTYPE_HSE;
+
+    RCC_OscInitStruct.HSEState =
+        RCC_HSE_ON;
+
+    RCC_OscInitStruct.HSEPredivValue =
+        RCC_HSE_PREDIV_DIV1;
+
+    RCC_OscInitStruct.HSIState =
+        RCC_HSI_ON;
+
+    RCC_OscInitStruct.PLL.PLLState =
+        RCC_PLL_ON;
+
+    RCC_OscInitStruct.PLL.PLLSource =
+        RCC_PLLSOURCE_HSE;
+
+    RCC_OscInitStruct.PLL.PLLMUL =
+        RCC_PLL_MUL9;
+
+
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct)
+        != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1 |
+        RCC_CLOCKTYPE_PCLK2;
+
+    RCC_ClkInitStruct.SYSCLKSource =
+        RCC_SYSCLKSOURCE_PLLCLK;
+
+    RCC_ClkInitStruct.AHBCLKDivider =
+        RCC_SYSCLK_DIV1;
+
+    RCC_ClkInitStruct.APB1CLKDivider =
+        RCC_HCLK_DIV2;
+
+    RCC_ClkInitStruct.APB2CLKDivider =
+        RCC_HCLK_DIV1;
+
+
+    if (HAL_RCC_ClockConfig(
+            &RCC_ClkInitStruct,
+            FLASH_LATENCY_2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+
+/* =========================================================
+   USART1
+   ========================================================= */
+
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance = USART1;
+
+    huart1.Init.BaudRate = 115200;
+
+    huart1.Init.WordLength =
+        UART_WORDLENGTH_8B;
+
+    huart1.Init.StopBits =
+        UART_STOPBITS_1;
+
+    huart1.Init.Parity =
+        UART_PARITY_NONE;
+
+    huart1.Init.Mode =
+        UART_MODE_TX_RX;
+
+    huart1.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+
+    huart1.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+
+
+    if (HAL_UART_Init(&huart1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+
+/* =========================================================
+   DMA
+   ========================================================= */
+
+static void MX_DMA_Init(void)
+{
+    /* Enable DMA1 clock */
+
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+
+    /* DMA1 Channel 4 - USART1 TX */
+
+    HAL_NVIC_SetPriority(
+        DMA1_Channel4_IRQn,
+        0,
+        0
+    );
+
+    HAL_NVIC_EnableIRQ(
+        DMA1_Channel4_IRQn
+    );
+
+
+    /* DMA1 Channel 5 - USART1 RX */
+
+    HAL_NVIC_SetPriority(
+        DMA1_Channel5_IRQn,
+        0,
+        0
+    );
+
+    HAL_NVIC_EnableIRQ(
+        DMA1_Channel5_IRQn
+    );
+}
+
+
+/* =========================================================
+   GPIO
+   ========================================================= */
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+
+    /* Enable GPIO clocks */
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+
+
+    /* PA1 LOW */
+
+    HAL_GPIO_WritePin(
+        GPIOA,
+        GPIO_PIN_1,
+        GPIO_PIN_RESET
+    );
+
+
+    /* PB15 LOW */
+
+    HAL_GPIO_WritePin(
+        GPIOB,
+        GPIO_PIN_15,
+        GPIO_PIN_RESET
+    );
+
+
+    /* -----------------------------------------------------
+       PA1 - DHT11
+       ----------------------------------------------------- */
+
+    GPIO_InitStruct.Pin =
+        GPIO_PIN_1;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_OUTPUT_PP;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    GPIO_InitStruct.Speed =
+        GPIO_SPEED_FREQ_HIGH;
+
+    HAL_GPIO_Init(
+        GPIOA,
+        &GPIO_InitStruct
+    );
+
+
+    /* -----------------------------------------------------
+       PB14 INPUT
+       ----------------------------------------------------- */
+
+    GPIO_InitStruct.Pin =
+        GPIO_PIN_14;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_INPUT;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    HAL_GPIO_Init(
+        GPIOB,
+        &GPIO_InitStruct
+    );
+
+
+    /* -----------------------------------------------------
+       PB15 OUTPUT
+       ----------------------------------------------------- */
+
+    GPIO_InitStruct.Pin =
+        GPIO_PIN_15;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_OUTPUT_PP;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    GPIO_InitStruct.Speed =
+        GPIO_SPEED_FREQ_LOW;
+
+    HAL_GPIO_Init(
+        GPIOB,
+        &GPIO_InitStruct
+    );
+}
+
+
+/* =========================================================
+   ERROR HANDLER
+   ========================================================= */
+
+void Error_Handler(void)
+{
+    __disable_irq();
+
+    while (1)
+    {
+    }
+}
+
+
+#ifdef USE_FULL_ASSERT
+
+void assert_failed(uint8_t *file,
+                   uint32_t line)
+{
+}
+
+#endif
+
+
+
+
+
+#Arduino IDE
+
+#include <ESP8266WiFi.h>
+#include <ThingSpeak.h>
+#include <DHT.h>
+
+#define DHTPIN D4
+#define DHTTYPE DHT11
+
+DHT dht(DHTPIN, DHTTYPE);
+
+const char* ssid = "Redmi 12";
+const char* password = "sandhiya";
+
+unsigned long channelID = 3506380;
+const char* apiKey = "3N84VHFJGO9SAHTN";
+
+WiFiClient client;
+
+void setup()
+{
+  Serial.begin(9600);
+
+  dht.begin();
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected!");
+
+  ThingSpeak.begin(client);
+}
+
+void loop()
+{
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  if (isnan(humidity) || isnan(temperature))
+  {
+    Serial.println("Failed to read DHT11!");
+    delay(2000);
+    return;
+  }
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" °C");
+
+  Serial.print("Humidity: ");
+  Serial.print(humidity);
+  Serial.println(" %");
+
+  ThingSpeak.setField(1, temperature);
+  ThingSpeak.setField(2, humidity);
+
+  int status = ThingSpeak.writeFields(channelID, apiKey);
+
+  if (status == 200)
+  {
+    Serial.println("Data uploaded successfully!");
+  }
+  else
+  {
+    Serial.print("Upload failed. Error code: ");
+    Serial.println(status);
+  }
+
+  delay(15000);
+}
+
